@@ -202,6 +202,37 @@ fn card_room_kept_on() -> bool {
 /// buffers, so no room is kept for them any more.
 static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// The most of the card's memory kept for card copies not made yet
+/// (`VICTORY_CARD_ROOM_FOR_BUFFERS_MB`, 1,024 by default), whatever
+/// [`card_limits`] allows the copies in all.
+///
+/// The world's burst of copies takes 941 to 945 MB (97 or 98 copies, the
+/// runs of 2026-11-25). With `VICTORY_CARD_BUFFERS_MB=6144` (the README's
+/// preset then) the room kept was the 5,200 MB the copies never took, for
+/// the whole run: on a card whose budget was 9,610 MB the texture queue
+/// found no room from the first world frame on, 16,567 slots waited and
+/// surfaces stayed blank or showed old blocks. Kept to 1,024 MB, the same
+/// copies were made (97 of 941 MB), the queue uploaded 28,650 textures
+/// (8.3 GB) against 15,620 (4.2 GB), and 37 slots waited for memory
+/// against 680, at the same frame rate. Copies past this keep no room
+/// ahead: [`card_for`] still makes them while the card has it.
+fn card_room_cap() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_CARD_ROOM_FOR_BUFFERS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+            << 20
+    })
+}
+
+/// The room kept for copies not made yet: what neither the copies made nor
+/// those turned down have taken of the limit, the limit at most `cap`.
+fn room_kept(limit: u64, cap: u64, made: u64, refused: u64) -> u64 {
+    limit.min(cap).saturating_sub(made + refused)
+}
+
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
 /// the switch off or without card copies.
@@ -209,7 +240,34 @@ pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    room_kept(
+        card_limits().1,
+        card_room_cap(),
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        CARD_REFUSED[1].load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+mod room_tests {
+    use super::room_kept;
+
+    const MB: u64 = 1 << 20;
+
+    #[test]
+    fn the_room_kept_for_copies_not_made_is_capped() {
+        // the default limit: what the copies have not taken yet
+        assert_eq!(room_kept(1024 * MB, 1024 * MB, 0, 0), 1024 * MB);
+        assert_eq!(room_kept(1024 * MB, 1024 * MB, 945 * MB, 0), 79 * MB);
+        // a limit of 6,144 MB keeps no more than the cap: 79 MB after the
+        // burst, not the 5,199 MB the copies never took
+        assert_eq!(room_kept(6144 * MB, 1024 * MB, 945 * MB, 0), 79 * MB);
+        // copies turned down give their room up, and past the cap none is kept
+        assert_eq!(room_kept(6144 * MB, 1024 * MB, 900 * MB, 200 * MB), 0);
+        assert_eq!(room_kept(6144 * MB, 1024 * MB, 2000 * MB, 0), 0);
+        // a smaller limit than the cap is the limit
+        assert_eq!(room_kept(512 * MB, 1024 * MB, 100 * MB, 0), 412 * MB);
+    }
 }
 
 /// The copies in the card's memory.

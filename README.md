@@ -118,10 +118,11 @@ $env:VICTORY_DISPLAY_MODE = "1920x1080"
 ```
 
 #### Achados importantes de tuning & diagnóstico
+- **`VICTORY_CARD_BUFFERS_MB=6144` e a fila de texturas**: a fila de texturas deixa livre na placa o espaço das cópias de buffers ainda não feitas. Com 6144, esse espaço era de ~5,2 GB que as cópias nunca usaram (o mundo faz ~97 cópias, ~945 MB), e as texturas ficavam esperando para sempre (superfícies vazias ou em blocos). Agora o espaço guardado tem teto de 1024 MB (`VICTORY_CARD_ROOM_FOR_BUFFERS_MB`): com o mesmo preset, 28.650 texturas (8,3 GB) chegam à placa contra 15.620 (4,2 GB), no mesmo FPS.
 - **`VICTORY_TEXTURE_NO_WAIT=1`**: elimina stalls de lock na leitura de memória do título durante refresh de texturas (`textures` cai de `900–3.700 ms` para `6–25 ms`).
 - **`VICTORY_DISPLAY_MODE=1920x1080`**: reduz a resolução interna de renderização mesmo em monitores 4K (a janela apenas faz upscale barato no `Present`).
 - **`VICTORY_CARD_FETCH_INFLIGHT` (deixar desligado / `0`)**: ligá-lo derruba `copying back` de `~162 ms` para `~45 ms`, mas sobrecarrega a GPU (`on the GPU` sobe de `~50–65 ms` para `~200–330 ms`), reduzindo o FPS total na RTX 5060 Ti (`1.9–2.6 fps` vs `3.5–6.0 fps`).
-- **`VICTORY_BVH_BUILDER=1` (RTGI — experimental)**: atinge **50/53** compute shaders em wave32; os 3 faltantes (`39321a95223001ed`, `77360df21e12ea43`, `9fc111d3be79364f`) falham em `v_readfirstlane_b32` sob divergência. Com `VICTORY_FIRSTLANE_OWN=1` o builder chega a **53/53** e ativa, mas o atalho corrompe offsets de AABB na memória (crash após ~18 s) — manter desligado até a troca completa entre metades da wave64.
+- **`VICTORY_BVH_BUILDER=1` (RTGI — experimental)**: agora atinge **53/53** compute shaders em wave32 sem `VICTORY_FIRSTLANE_OWN`: o `v_readfirstlane_b32` dos três scans é provado igual em toda a wave do console (`console_same`), e o builder roda. Mesmo assim o título cai poucos segundos depois, também com `VICTORY_BVH_QUARANTINE=1`, então a corrupção vem de como o título consome os resultados do builder, não desses shaders — manter desligado por enquanto.
 
 ### Build de diagnóstico (`diag`)
 ```powershell
@@ -230,7 +231,7 @@ $env:VICTORY_DISPLAY_MODE = "1920x1080"
 .\target\release\victory.exe run --execute <game_dir>\<title_exe>
 ```
 
-> **Tuning notes (RTX 5060 Ti):** Keep `VICTORY_CARD_FETCH_INFLIGHT` off (`0`, default) — enabling it drops `copying back` (`~162 → ~45 ms`) but increases `on the GPU` (`~50–65 → ~200–330 ms`), lowering overall FPS. `VICTORY_BVH_BUILDER=1` reaches `50/53` compute shaders on wave32 (missing 3 `v_readfirstlane_b32` scans: `39321a95223001ed`, `77360df21e12ea43`, `9fc111d3be79364f`); `VICTORY_FIRSTLANE_OWN=1` reaches `53/53` and activates the builder, but corrupts BVH AABB offsets (~18 s crash), so leave it off for now.
+> **Tuning notes (RTX 5060 Ti):** Keep `VICTORY_CARD_FETCH_INFLIGHT` off (`0`, default) — enabling it drops `copying back` (`~162 → ~45 ms`) but increases `on the GPU` (`~50–65 → ~200–330 ms`), lowering overall FPS. `VICTORY_BVH_BUILDER=1` now reaches `53/53` compute shaders on wave32 without `VICTORY_FIRSTLANE_OWN` (the three scans' `v_readfirstlane_b32` is proved alike across each console wave), and the builder runs, but the title still crashes a few seconds later (with `VICTORY_BVH_QUARANTINE=1` too), so leave it off for now. `VICTORY_CARD_BUFFERS_MB=6144` no longer starves the texture queue: the room kept for buffer copies not made yet is capped at 1,024 MB (`VICTORY_CARD_ROOM_FOR_BUFFERS_MB`), which took textures on the card from 15,620 (4.2 GB) to 28,650 (8.3 GB) at the same FPS.
 
 Diagnostics build:
 ```powershell
