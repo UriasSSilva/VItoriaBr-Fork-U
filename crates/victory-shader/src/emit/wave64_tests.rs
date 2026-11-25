@@ -556,6 +556,82 @@ fn a_first_lane_refusal_is_retried_wave_wide() {
     ));
 }
 
+/// A lane mask the console code parks in VGPR lanes and reads back (`v_writelane`, then
+/// `v_readlane`): untracked, it is selected by as a number. Taken with each host wave as a
+/// wave of its own (the last resort for programs that do not translate otherwise), every
+/// other lane of `0xaaaaaaaa_aaaaaaaa` picks 1, as on the console.
+#[test]
+fn a_parked_lane_mask_selects_by_the_host_lane_in_local_waves() {
+    let words = [
+        // (code that reads the lane layout, as the title's around such masks does: the
+        // program then runs in two host waves of 32)
+        0xD765_0006,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v6, -1, 0
+        0xBE8C_03FF,
+        0xAAAA_AAAA, // s_mov_b32 s12, 0xaaaaaaaa
+        0xBE8D_03FF,
+        0xAAAA_AAAA, // s_mov_b32 s13, 0xaaaaaaaa
+        0xD761_0009,
+        0x0001_080C, // v_writelane_b32 v9, s12, 4
+        0xD761_0009,
+        0x0001_0A0D, // v_writelane_b32 v9, s13, 5
+        0xD760_000E,
+        0x0001_0909, // v_readlane_b32 s14, v9, 4
+        0xD760_000F,
+        0x0001_0B09, // v_readlane_b32 s15, v9, 5
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0xD501_0003,
+        0x003A_0501, // v_cndmask_b32 v3, v1, v2, s[14:15]
+        0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 3 << 8 | 5, // buffer_store_dword v3, v5, s[8:11], 0 offen
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    // (the local waves of the allocation idiom alone still turn the number down)
+    let idiom = lower::with_local_waves(|| lowered(&native, &p, &HashSet::new()));
+    assert!(
+        matches!(&idiom, Err(ShaderError::Unsupported { what, .. }) if *what == "a constant lane mask in a half-wave"),
+        "{:?}",
+        idiom.err()
+    );
+    let shader = lower::with_local_waves_any(|| lowered(&native, &p, &HashSet::new())).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return;
+        }
+    };
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    for (t, &got) in out[0].iter().enumerate().take(64) {
+        assert_eq!(got, (t & 1) as u32, "thread {t}");
+    }
+    eprintln!("ran on the hardware device: every other lane picked 1");
+}
+
 /// Three console waves (192 threads). Each wave writes its number plus 7 to its LDS dword, then
 /// after a group barrier wave w sums the dwords of the waves below it in a loop whose lanes leave
 /// when the count reaches w: the per-lane exit is the same for the whole console wave (it

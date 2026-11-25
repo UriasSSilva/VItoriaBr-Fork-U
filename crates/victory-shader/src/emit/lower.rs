@@ -3536,6 +3536,30 @@ impl<'a> Lower<'a> {
                     } else if !self.exchange.as_ref().is_some_and(|e| e.1) && !b.is_none_or(|b| self.all_lanes(b)) {
                         // (a group of 32 or fewer has no other half to exchange with)
                         need(b.unwrap_or(0));
+                        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                            let at = b.map(|b| self.x.p.blocks[b].offset);
+                            let def = self.x.p.blocks.iter().flat_map(|bl| &bl.insts).find(|i| i.writes.iter().any(|w| w.1 == lo));
+                            eprintln!(
+                                "WAVE64-BALLOT mask {lo:?} made in block {b:?} at {at:x?} by {:?} at {:x?}; its lane bit's atoms {:?}",
+                                def.map(|i| i.name()),
+                                def.map(|i| i.machine.offset),
+                                self.x.st.bools.support(m)
+                            );
+                            if let (Some(b), Some(regions)) = (b, lane_regions(self.x.st)) {
+                                for (d, region) in regions.iter().filter(|(_, r)| r[b]) {
+                                    if let LaneExit::Branch { when, .. } = self.x.st.exits[*d] {
+                                        let last = self.x.p.blocks[*d].insts.last();
+                                        eprintln!(
+                                            "  WAVE64-BALLOT around it: the lane branch closing block {d} ({:?} at {:x?}) on {:?}; region of {} blocks",
+                                            last.map(|i| i.name()),
+                                            last.map(|i| i.machine.offset),
+                                            self.x.st.bools.support(when),
+                                            region.iter().filter(|&&x| x).count()
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         return Err("a lane mask exchanged where not every lane runs");
                     }
                     xy = self.exchange_halves(at, xy.0);
@@ -7977,6 +8001,26 @@ impl<'a> Lower<'a> {
                     None if self.mask_data == MaskData::Console => {
                         // Each host wave taken as a wave of its own has no
                         // console lane numbers to pick the bits by.
+                        if self.local && self.local_any {
+                            // Each host wave as a wave of its own, every mask taken over
+                            // its own lanes ([`with_local_waves_any`]): a mask read as a
+                            // number there is the host wave's ballot, lanes in the low
+                            // dword (`mask_dword`), and so is one the console code parked
+                            // in a VGPR lane and read back. This lane's bit is the host
+                            // lane's of the low dword.
+                            // shortcut: a constant whose two dwords differ is read by the
+                            // low one alone (exact for those whose dwords are equal: every
+                            // other lane, every other pair...).
+                            let m = mask.ok_or(UNTRACKED)?;
+                            let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
+                            self.s.flags |= flags::WAVE_OPS;
+                            let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[]);
+                            let (k31, one, z) = (self.s.m.i32(31), self.s.m.i32(1), self.s.m.i32(0));
+                            let sh = self.s.m.bin(c, Bin::And, lane, k31);
+                            let t = self.s.m.bin(c, Bin::LShr, lo, sh);
+                            let t = self.s.m.bin(c, Bin::And, t, one);
+                            self.s.m.cmp(c, pred::NE, t, z)
+                        } else {
                         if self.local {
                             return Err("a constant lane mask in a half-wave");
                         }
@@ -7995,6 +8039,7 @@ impl<'a> Lower<'a> {
                         };
                         self.cross_lane(false)?;
                         self.lane_bit(c, lo, hi)
+                        }
                     }
                     None => return Err(UNTRACKED),
                 };
