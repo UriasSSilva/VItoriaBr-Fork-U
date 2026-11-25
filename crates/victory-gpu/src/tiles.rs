@@ -46,8 +46,19 @@
 //! Only for a texture the title places in memory and fills, two-dimensional,
 //! one layer, more than one level, of [`floor`] bytes or more, whose memory
 //! is not all its own when the host copy is made (`resource.rs` `hosted`);
-//! every other texture is made as before. Off unless
-//! `VICTORY_LEVELS_ON_DEMAND=1`.
+//! every other texture is made as before. On by default on a card of tiled
+//! resources tier 2 or more; `VICTORY_LEVELS_ON_DEMAND=0` turns it off.
+//!
+//! Made the default after the runs of 2026-11-25 (RTX 5060 Ti, tier 4): a
+//! committed host copy holds zeros in the levels the title does not hold,
+//! and its view showed them; some 700 textures stayed partly uploaded for
+//! good (the title streams their small levels only), and near the camera
+//! surfaces read black or odd blocks from those levels, glass had no grime,
+//! the yard behind a window lost its wires and paving. With levels on
+//! demand, 2,216 textures were made so (612 alive), 1,525 MB of the card
+//! were not taken by levels the title does not hold (27 MB of tiles given),
+//! 40,583 textures were uploaded in four minutes against 36,588 in twenty-one,
+//! at the same frame rate, and those surfaces showed.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -58,6 +69,14 @@ use crate::host::host;
 
 /// The card's tile: 64 KiB.
 const TILE: u64 = 64 << 10;
+
+/// The most tiles the smallest held level of a texture may take to be
+/// given without room on the card ([`Tiled::floor_levels`]): 1 MiB.
+const FLOOR_TILES: u32 = 16;
+
+/// The tiles given in all up to which the smallest held levels are given
+/// without room on the card ([`Tiled::floor_levels`]): 512 MiB.
+const FLOOR_CAP: u64 = 512 << 20;
 
 /// Tiles in one heap of the pool (64 MiB). The largest level given is a
 /// 4096x4096 one of one byte a texel: 256 tiles.
@@ -72,13 +91,13 @@ const HEAP_TILES: u32 = 1024;
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 /// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
+/// (on unless `VICTORY_LEVELS_ON_DEMAND=0`), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
 /// tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        if std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "0") {
             return false;
         }
         let Some(host) = host() else {
@@ -99,7 +118,7 @@ pub(crate) fn wanted() -> bool {
             tier,
             on,
             floor_kb = floor() >> 10,
-            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
+            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=0 turns it off)"
         );
         on
     })
@@ -344,10 +363,10 @@ impl Tiled {
     /// from its staging buffer, of which `held` are the title's now (the
     /// others are zeros there): tiles for the held ones that have none.
     /// `room`: whether the card has room for more host copies
-    /// (`resource.rs` `room`). Without room no held level gets tiles: the
-    /// list still brings the levels that have theirs up to date (which
-    /// takes none of the card's memory), and its copies into the others go
-    /// nowhere. (An upload of a host copy that exists passes the full
+    /// (`resource.rs` `room`). Without room no held level gets tiles but the
+    /// smallest ([`Tiled::floor_levels`]): the list still brings the levels
+    /// that have theirs up to date (which takes none of the card's memory),
+    /// and its copies into the others go nowhere. (An upload of a host copy that exists passes the full
     /// card's gate in `draw.rs` on the ground that it takes no memory;
     /// with tiles given here regardless, the line would not bound these
     /// textures.)
@@ -377,8 +396,11 @@ impl Tiled {
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
         // The levels the card itself writes are few and are not kept
-        // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        // waiting: a write of the card's into no memory is lost. Nor is the
+        // smallest held level ([`Tiled::floor_levels`]): without it a texture
+        // with no level given reads zeros, black, until the card has room.
+        let may = if room { named } else { card | self.floor_levels(held) };
+        let changed = self.give_locked(&mut given, queue, device, texture, named, may);
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
     }
@@ -428,6 +450,26 @@ impl Tiled {
             self.unclaim(without);
         }
         changed
+    }
+
+    /// Of `held`, the levels given tiles even when the card has no room: the
+    /// smallest held level, with the levels the card packs with it, if it
+    /// takes [`FLOOR_TILES`] tiles or fewer, while all the tiles given take
+    /// less than [`FLOOR_CAP`]. A view then shows the texture blurred where
+    /// it read zeros (black) until the card had room: in the run of
+    /// 2026-11-25, 8,768 uploads left held levels without tiles for want of
+    /// room while 31 to 84 MB of tiles were given in all, and a street's
+    /// ground stayed black.
+    fn floor_levels(&self, held: u32) -> u32 {
+        if given_total() >= FLOOR_CAP {
+            return 0;
+        }
+        let Some(smallest) = (0..self.levels.min(32)).rev().find(|&level| held & (1 << level) != 0) else {
+            return 0;
+        };
+        let first_packed = self.standard.len() as u32;
+        let tiles = if smallest < first_packed { self.standard[smallest as usize] } else { self.packed };
+        if tiles <= FLOOR_TILES { self.with_level(smallest) } else { 0 }
     }
 
     /// The bits of the levels that get their tiles with level `level`:
@@ -1378,13 +1420,17 @@ void look() {
                 assert!(all(bytes, want), "{what}: level {level} reads {bytes:?}, wanted {want}");
             }
         };
-        // No room: nothing is given, the held levels are said to wait,
-        // nothing is shown, every level reads zeros.
+        // No room: only the smallest held level gets its tiles (with the
+        // levels packed with it), so the texture shows blurred and not
+        // black; the larger held levels wait and read zeros.
         let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), false);
         rig.check("an upload without room");
-        assert!(!changed && waiting, "without room: changed {changed}, waiting {waiting}");
-        assert_eq!(tiled.given_bytes(), 0, "without room no tile is given");
-        assert_eq!(tiled.first_shown(), None);
+        assert!(changed && waiting, "without room: changed {changed}, waiting {waiting}");
+        let floor = tiled.first_shown().expect("without room the smallest held level is shown");
+        assert!(floor > 3, "without room the larger held levels wait: shown from {floor}");
+        assert!((3..floor).all(|level| !tiled.has_tiles(level)));
+        assert!(tiled.has_tiles(u32::from(LEVELS) - 1), "the smallest level has its tiles");
+        assert!(tiled.given_bytes() <= u64::from(FLOOR_TILES) * TILE);
         read_as_given(rig, "without room");
         // Asked again with room: the same levels get theirs.
         let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), true);
@@ -1555,8 +1601,10 @@ void look() {
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(TILE, Ordering::Relaxed);
         let mut tiled = Tiled {
-            // Level 0 demands > HEAP_TILES so `take()` fails deterministically.
-            standard: vec![HEAP_TILES + 1, 1],
+            // Level 0 demands > HEAP_TILES so `take()` fails deterministically;
+            // level 1 is over the floor's size, so nothing is mapped on this
+            // committed texture without room.
+            standard: vec![HEAP_TILES + 1, FLOOR_TILES + 1],
             packed: 0,
             levels: 2,
             full: TILE,
