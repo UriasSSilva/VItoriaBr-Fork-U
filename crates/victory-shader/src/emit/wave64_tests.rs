@@ -555,3 +555,113 @@ fn a_first_lane_refusal_is_retried_wave_wide() {
         "a descriptor chosen by control flow"
     ));
 }
+
+/// Three console waves (192 threads). Each wave writes its number plus 7 to its LDS dword, then
+/// after a group barrier wave w sums the dwords of the waves below it in a loop whose lanes leave
+/// when the count reaches w: the per-lane exit is the same for the whole console wave (it
+/// depends on the thread id shifted right by 6), and the sum the loop carries, which it reads
+/// back with `v_readfirstlane`, is the same in every lane of it. Each thread stores its wave's sum.
+fn wave_scan() -> NativeProgram {
+    let words = [
+        0x2C02_0086, // v_lshrrev_b32 v1, 6, v0: the console wave
+        0x3404_0282, // v_lshlrev_b32 v2, 2, v1
+        0x4A06_0287, // v_add_nc_u32 v3, 7, v1
+        0xD834_0000,
+        0x0000_0302, // ds_write_b32 v2, v3
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0x7DAA_0280, // v_cmpx_ne_u32 exec, 0, v1
+        0xBF88_0011, // s_cbranch_execz the restore of EXEC
+        0xBE86_047E, // s_mov_b64 s[6:7], exec: the lanes still in the loop
+        0xBE92_0380, // s_mov_b32 s18, 0
+        0xBE91_0380, // s_mov_b32 s17, 0
+        0xBF82_0002, // s_branch the loop body
+        0x87FE_0610, // s_and_b64 exec, s[16:17], s[6:7]
+        0x7E22_0504, // v_readfirstlane_b32 s17, v4: the sum so far
+        0x8F10_8212, // s_lshl_b32 s16, s18, 2
+        0x8112_8112, // s_add_i32 s18, s18, 1
+        0x7E08_0210, // v_mov_b32 v4, s16
+        0xD8D8_0000,
+        0x0400_0004, // ds_read_b32 v4, v4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A08_0811, // v_add_nc_u32 v4, s17, v4
+        0xBE90_047E, // s_mov_b64 s[16:17], exec
+        0x7DA4_0212, // v_cmpx_eq_u32 exec, s18, v1: these lanes are done
+        0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
+        0xBF85_FFF3, // s_cbranch_scc1 back while some lane is left
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+        0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 4 << 8 | 5, // buffer_store_dword v4, v5, s[8:11], 0 offen
+    ];
+    let mut n = native_of(&words, true, 192);
+    n.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 1 << 15, // 5 user SGPRs, 512 bytes of LDS
+        threads: [192, 1, 1],
+    });
+    n
+}
+
+/// The scan's first-lane read stands where only some lanes run, yet every lane of a console
+/// wave runs it or none does and holds the same sum: each host wave reads its own first lane.
+/// Its barrier comes before the loop, so it waits for the group (no lane is cut short yet), and
+/// what the loop reads from LDS is what every wave wrote before it.
+#[test]
+fn a_scan_over_console_waves_reads_its_sum_in_each_host_wave() {
+    let native = wave_scan();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let same = lower::console_same(&p, &st, [192, 1, 1], &HashSet::new());
+    let read = p
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(b, block)| {
+            block.insts.iter().enumerate().find(|(_, i)| i.name() == "v_readfirstlane_b32").map(|(i, inst)| (b, i, inst))
+        })
+        .expect("the first-lane read");
+    let (b, i, inst) = read;
+    let value = inst.read(ir::Reg::V(4)).expect("v4");
+    assert!(same.first_lane_own(&st, b, st.guards[b][i], value), "the loop's sum is alike in a console wave");
+    // without the rows of whole console waves (x not a multiple of 64) nothing is proved
+    let none = lower::console_same(&p, &st, [96, 2, 1], &HashSet::new());
+    assert!(!none.first_lane_own(&st, b, st.guards[b][i], value));
+
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return;
+        }
+    };
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(192)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    // wave 0 sums nothing, wave 1 the 7 of wave 0, wave 2 the 7 and 8 of waves 0 and 1
+    for (t, &got) in out[0].iter().enumerate().take(192) {
+        assert_eq!(got, [0, 7, 15][t / 64], "thread {t}");
+    }
+    eprintln!("ran on the hardware device: the console waves' sums 0, 7, 15");
+}

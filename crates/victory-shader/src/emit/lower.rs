@@ -265,6 +265,9 @@ struct Lower<'a> {
     /// With `exchange`: VGPR values every lane holds alike ([`lane_uniform`]); a first-lane
     /// read of one needs nothing from the other host wave.
     uniform: HashSet<Value>,
+    /// With `exchange`: what is alike in every lane of a console wave ([`console_same`]), made
+    /// the first time a first-lane read where not every lane runs asks.
+    console_same: Option<ConsoleSame>,
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
@@ -512,6 +515,303 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// What [`console_same`] proved of a console wave64 program run as two host waves of 32.
+#[derive(Debug, Default)]
+pub(super) struct ConsoleSame {
+    /// VGPR values, and the compare results lane conditions are made of, that are the same in
+    /// every lane of a console wave that holds them.
+    values: HashSet<Value>,
+    /// Per IR block: every lane of a console wave runs it or none does (no lane branch whose
+    /// condition can split a console wave lies around it).
+    whole: Vec<bool>,
+}
+
+impl ConsoleSame {
+    /// Whether condition `b` holds in all the lanes of a console wave or in none.
+    fn cond(&self, st: &Structured, b: Bool) -> bool {
+        cond_same(st, &self.values, b)
+    }
+
+    /// Whether a first-lane read of `value` in IR block `block`, under `guard`, reads the same
+    /// in a host wave's own first lane as in the console wave's: the lanes of a console wave run
+    /// it together, and every one of them holds the same value.
+    pub(super) fn first_lane_own(&self, st: &Structured, block: usize, guard: Option<Bool>, value: Value) -> bool {
+        self.whole.get(block).copied().unwrap_or(false)
+            && guard.is_none_or(|g| self.cond(st, g))
+            && self.values.contains(&value)
+    }
+}
+
+fn cond_same(st: &Structured, same: &HashSet<Value>, b: Bool) -> bool {
+    st.bools.support(b).iter().all(|a| match *a {
+        Atom::Uniform(_) => true,
+        Atom::Lane(v) | Atom::Phi(v) => same.contains(&v),
+        Atom::Quad(_) | Atom::Opaque(_) | Atom::Constant(_) => false,
+    })
+}
+
+/// Values a console wave64 compute program holds alike in all the lanes of a console wave, for
+/// a host whose waves are 32 lanes (each console wave is two host waves, `exchange`).
+///
+/// The proof is a greatest fixed point: a value stays while what makes it stays.
+/// - Scalars are one value per console wave (the translation keeps the two host waves' scalars
+///   equal), except lane masks, whose lane bits are looked at.
+/// - With thread groups whose rows are whole console waves (x a multiple of 64), the thread id's
+///   x shifted right by 6 or more, and its y and z, are the same in every lane of a console wave.
+/// - A vector operation without lane access (no DPP, SDWA, lane read or write, `v_mbcnt`) of
+///   such operands gives such a value. Under a guard, the guard must hold in the whole console
+///   wave or none of it, and the old value must be one too.
+/// - An LDS read at such an address, where no LDS write of the group can come between the two
+///   host waves' reads (none reaches the read, nor is reached from it, without a group barrier).
+/// - A phi of such values, at a block where no lane branch that can split a console wave joins.
+/// - A lane condition stays when every atom of it does; a branch on any other condition splits
+///   a console wave, and the blocks in its region are not `whole`.
+///
+/// Wave-wide branches ([`Structured::wide`]) and scalar branches split no wave.
+pub(super) fn console_same(
+    p: &Program,
+    st: &Structured,
+    threads: [u32; 3],
+    fence_only: &HashSet<usize>,
+) -> ConsoleSame {
+    let n = p.blocks.len();
+    let Some(regions) = lane_regions(st) else {
+        return ConsoleSame::default();
+    };
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let mask_bool = |v: Value| st.masks.get(&v).copied().or_else(|| st.highs.get(&v).and_then(|lo| st.masks.get(lo).copied()));
+    let rows = threads[0].is_multiple_of(64);
+    let input = |r: Reg| p.inputs.iter().find(|(x, _)| *x == r).map(|(_, v)| *v);
+    let (tid_x, tid_y, tid_z) = (input(Reg::V(0)), input(Reg::V(1)), input(Reg::V(2)));
+    // where each mask phi stands
+    let mut phi_block: HashMap<Value, usize> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for phi in &block.phis {
+            phi_block.insert(phi.value, b);
+        }
+    }
+    let lds_stable = lds_stable_reads(p, fence_only);
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        eprintln!("WAVE64-SAME fence-only barrier blocks {fence_only:?}, LDS reads alike between barriers {lds_stable:?}");
+    }
+
+    // the universe: every value a rule below could keep
+    let mut same: HashSet<Value> = HashSet::new();
+    for block in &p.blocks {
+        for phi in &block.phis {
+            same.insert(phi.value);
+        }
+        for inst in &block.insts {
+            same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+        }
+    }
+    if rows {
+        same.extend([tid_y, tid_z].into_iter().flatten());
+    }
+    let mut whole = vec![true; n];
+    loop {
+        // the lane branches that can split a console wave, by the values kept so far
+        let split: Vec<&Vec<bool>> = regions
+            .iter()
+            .filter(|(d, _)| match st.exits[*d] {
+                LaneExit::Branch { when, .. } => !cond_same(st, &same, when),
+                _ => false,
+            })
+            .map(|(_, r)| r)
+            .collect();
+        whole = (0..n).map(|b| split.iter().all(|r| !r[b])).collect();
+        let split_d: Vec<usize> = regions
+            .iter()
+            .filter(|(d, _)| match st.exits[*d] {
+                LaneExit::Branch { when, .. } => !cond_same(st, &same, when),
+                _ => false,
+            })
+            .map(|(d, _)| *d)
+            .collect();
+        // a join of lanes a split branch parted
+        let joins = |b: usize| {
+            p.blocks[b]
+                .preds
+                .iter()
+                .any(|&q| split_d.contains(&q) || split.iter().any(|r| r[q]))
+        };
+        let mut next: HashSet<Value> = HashSet::new();
+        if rows {
+            next.extend([tid_y, tid_z].into_iter().flatten().filter(|v| same.contains(v)));
+        }
+        for (b, block) in p.blocks.iter().enumerate() {
+            for phi in &block.phis {
+                if !same.contains(&phi.value) || joins(b) {
+                    continue;
+                }
+                let kept = match phi.reg {
+                    Reg::V(_) => phi.args.iter().all(|a| same.contains(a)),
+                    // a lane mask's phi: its incoming lane bits
+                    _ => st
+                        .phi_masks
+                        .get(&phi.value)
+                        .is_some_and(|edges| edges.iter().all(|&e| cond_same(st, &same, e))),
+                };
+                if kept {
+                    next.insert(phi.value);
+                }
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                let writes = || inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1);
+                if !writes().any(|w| same.contains(&w)) {
+                    continue;
+                }
+                let name = inst.name();
+                let vec_same = |reg: u8| {
+                    let read: Vec<Value> =
+                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                    !read.is_empty() && read.iter().all(|x| same.contains(x))
+                };
+                let op_same = |op: &Operand| match *op {
+                    Operand::Vector { reg, .. } => vec_same(reg),
+                    Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)).is_none_or(|x| {
+                        !is_mask(x) || mask_bool(x).is_some_and(|m| cond_same(st, &same, m))
+                    }),
+                    // vccz, execz, scc, lds_direct
+                    Operand::Const(c) => !(251..=254).contains(&c),
+                    _ => true,
+                };
+                // a guarded write: the guard parts no console wave, and the lanes it leaves keep
+                // a value that is alike too
+                let guard_same = || match st.guards[b][i] {
+                    None => true,
+                    Some(g) => {
+                        cond_same(st, &same, g)
+                            && inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).all(|w| {
+                                inst.read(w.0).is_some_and(|old| same.contains(&old))
+                            })
+                    }
+                };
+                let kept = match &inst.fields {
+                    // a console wave's row of thread ids: x >> k, k >= 6
+                    Fields::Valu(v)
+                        if rows
+                            && name == "v_lshrrev_b32"
+                            && v.dpp.is_none()
+                            && v.sdwa.is_none()
+                            && matches!(v.src.first(), Some(&Operand::Const(c)) if (134..=159).contains(&c))
+                            && matches!(v.src.get(1), Some(&Operand::Vector { reg: 0, .. }))
+                            && inst.read(Reg::V(0)).is_some_and(|x| Some(x) == tid_x) =>
+                    {
+                        guard_same()
+                    }
+                    // a compare: the lane bit before EXEC masking
+                    Fields::Valu(v) if name.starts_with("v_cmp") && v.dpp.is_none() && v.sdwa.is_none() => {
+                        v.src.iter().all(op_same)
+                    }
+                    Fields::Valu(v)
+                        if v.dpp.is_none()
+                            && v.sdwa.is_none()
+                            && !name.starts_with("v_mbcnt")
+                            && !name.contains("lane") =>
+                    {
+                        v.src.iter().all(op_same) && guard_same()
+                    }
+                    Fields::Ds { addr, gds: false, .. } if name.starts_with("ds_read") => {
+                        lds_stable.contains(&(b, i))
+                            && match addr {
+                                Some(a) => op_same(a),
+                                None => true,
+                            }
+                            && guard_same()
+                    }
+                    _ => false,
+                };
+                if kept {
+                    next.extend(writes().filter(|w| same.contains(w)));
+                }
+            }
+        }
+        if next.len() == same.len() {
+            if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                for (b, block) in p.blocks.iter().enumerate() {
+                    for phi in block.phis.iter().filter(|phi| matches!(phi.reg, Reg::V(_))) {
+                        if !next.contains(&phi.value) {
+                            eprintln!(
+                                "WAVE64-SAME block {b} at {:#x}: phi {:?} not alike (args alike {:?}, join of a split {})",
+                                block.offset,
+                                phi.reg,
+                                phi.args.iter().map(|a| next.contains(a)).collect::<Vec<_>>(),
+                                joins(b)
+                            );
+                        }
+                    }
+                }
+            }
+            return ConsoleSame { values: next, whole };
+        }
+        same = next;
+    }
+}
+
+/// The LDS reads (block, instruction) that no LDS write of the thread group can come between:
+/// no write reaches the read, and the read reaches no write, without a group barrier between
+/// (a barrier in `fence_only` waits for no one and does not count).
+fn lds_stable_reads(p: &Program, fence_only: &HashSet<usize>) -> HashSet<(usize, usize)> {
+    let is_write = |inst: &Inst| {
+        let name = inst.name();
+        matches!(inst.fields, Fields::Ds { .. })
+            && !name.starts_with("ds_read")
+            && !name.starts_with("ds_swizzle")
+            && !name.contains("permute")
+    };
+    let barrier = |b: usize, inst: &Inst| inst.name() == "s_barrier" && !fence_only.contains(&b);
+    let succ = |b: usize| p.blocks[b].exit.successors();
+    // whether (tb, ti) is reached from just after (fb, fi) with no barrier on the way
+    let reaches = |(fb, fi): (usize, usize), (tb, ti): (usize, usize)| -> bool {
+        let insts = &p.blocks[fb].insts;
+        for (k, inst) in insts.iter().enumerate().skip(fi + 1) {
+            if fb == tb && k == ti {
+                return true;
+            }
+            if barrier(fb, inst) {
+                return false;
+            }
+        }
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack = succ(fb);
+        while let Some(b) = stack.pop() {
+            if std::mem::replace(&mut seen[b], true) {
+                continue;
+            }
+            let mut stopped = false;
+            for (k, inst) in p.blocks[b].insts.iter().enumerate() {
+                if b == tb && k == ti {
+                    return true;
+                }
+                if barrier(b, inst) {
+                    stopped = true;
+                    break;
+                }
+            }
+            if !stopped {
+                stack.extend(succ(b));
+            }
+        }
+        false
+    };
+    let mut writes = Vec::new();
+    let mut reads = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if is_write(inst) {
+                writes.push((b, i));
+            } else if inst.name().starts_with("ds_read") {
+                reads.push((b, i));
+            }
+        }
+    }
+    reads
+        .into_iter()
+        .filter(|&r| writes.iter().all(|&w| !reaches(w, r) && !reaches(r, w)))
+        .collect()
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -1423,9 +1723,10 @@ impl<'a> Lower<'a> {
         }
         // The title's barriers a thread of the group may never reach, which
         // leaves the others waiting on the host: those in blocks some lanes
-        // do not run, and all of them in a program with a loop closed by a
-        // plain jump (a lane still in it at the iteration limit leaves the
-        // program there, `abort_block`).
+        // do not run, and those a loop closed by a plain jump reaches (a lane
+        // still in it at the iteration limit leaves the program there,
+        // `abort_block`). A barrier no such loop reaches is passed by every
+        // thread before any can be cut short: it waits for the group.
         let fence_only: HashSet<usize> = if insts().any(|i| i.name() == "s_barrier") {
             let order = crate::ir::reverse_postorder(&p.blocks);
             let mut place = vec![usize::MAX; p.blocks.len()];
@@ -1436,17 +1737,37 @@ impl<'a> Lower<'a> {
                 let at = |b: usize| place.get(b).copied().unwrap_or(usize::MAX);
                 at(from) != usize::MAX && at(to) <= at(from)
             };
-            let cut_short = x
+            // the blocks a loop closed by a plain jump reaches: from its header on
+            let n = p.blocks.len();
+            let mut after_cut = vec![false; n];
+            let mut stack: Vec<usize> = x
                 .st
                 .exits
                 .iter()
                 .enumerate()
-                .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
+                .filter_map(|(b, e)| match *e {
+                    LaneExit::Jump(t) if back(b, t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            while let Some(b) = stack.pop() {
+                if b >= n || std::mem::replace(&mut after_cut[b], true) {
+                    continue;
+                }
+                match x.st.exits[b] {
+                    LaneExit::Jump(t) => stack.push(t),
+                    LaneExit::Branch { taken, not_taken, .. } => stack.extend([taken, not_taken]),
+                    // (an indirect exit is followed nowhere: its barriers are left to `all`)
+                    LaneExit::End | LaneExit::Indirect => {}
+                }
+            }
+            let indirect = x.st.exits.iter().any(|e| matches!(e, LaneExit::Indirect));
             let all = all_lane_blocks(x.st);
             (0..p.blocks.len())
                 .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
                 .filter(|&b| {
-                    cut_short
+                    after_cut[b]
+                        || (indirect && after_cut.iter().any(|&c| c))
                         || all
                             .as_ref()
                             .is_none_or(|all| !all.get(b).copied().unwrap_or(false))
@@ -1567,6 +1888,7 @@ impl<'a> Lower<'a> {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
                 _ => HashSet::new(),
             },
+            console_same: None,
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
                     super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
@@ -3915,6 +4237,39 @@ impl<'a> Lower<'a> {
     /// Whether every lane runs IR block `b` (always true without `exchange`).
     fn all_lanes(&self, b: usize) -> bool {
         self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(false))
+    }
+
+    /// Whether `inst`, a first-lane read of `src` in the current IR block, reads in the host
+    /// wave's own first lane what the console wave's first lane holds ([`console_same`]).
+    fn first_lane_own(&mut self, inst: &Inst, src: Option<&Operand>) -> bool {
+        let Some(&Operand::Vector { reg, .. }) = src else {
+            return false;
+        };
+        let Some(value) = inst.read(Reg::V(reg)) else {
+            return false;
+        };
+        let Some(threads) = self.s.threads else {
+            return false;
+        };
+        let b = self.cur_ir;
+        let Some(i) = self.x.p.blocks[b].insts.iter().position(|x| std::ptr::eq(x, inst)) else {
+            return false;
+        };
+        let guard = self.x.st.guards[b][i];
+        let same = self
+            .console_same
+            .get_or_insert_with(|| console_same(self.x.p, self.x.st, threads, &self.fence_only));
+        let own = same.first_lane_own(self.x.st, b, guard, value);
+        if !own && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            eprintln!(
+                "WAVE64-FIRSTLANE at {:#x}: whole block {}, guard alike {}, value alike {}",
+                inst.machine.offset,
+                same.whole.get(b).copied().unwrap_or(false),
+                guard.is_none_or(|g| same.cond(self.x.st, g)),
+                same.values.contains(&value)
+            );
+        }
+        own
     }
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
@@ -7784,6 +8139,11 @@ impl<'a> Lower<'a> {
                 };
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
+                    if !self.all_lanes(self.cur_ir) && self.first_lane_own(inst, v.src.first()) {
+                        // every lane of the console wave runs it, or none, and holds the same
+                        // value: the host wave's own first lane reads what the console's does
+                        return int(self, mine);
+                    }
                     if !self.all_lanes(self.cur_ir) {
                         // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
                         // first lane, exact when the value is the same in every lane of
